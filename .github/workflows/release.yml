@@ -1,0 +1,90 @@
+name: release
+
+# Nightly: if Herdr has a new stable release, rebase patches/ onto it, build,
+# test and publish the package to the pacman repo (release tag "repo").
+# Also runs when patches/ or PKGBUILD change on main, or by hand.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  push:
+    branches: [main]
+    paths: [patches/**, PKGBUILD, scripts/**]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+concurrency: release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Tools
+        run: pacman -Syu --noconfirm --needed git github-cli jq rustup cargo-nextest >/dev/null
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Decide
+        id: decide
+        run: |
+          git config --global --add safe.directory "$PWD"
+          latest=$(gh api repos/herdrdev/herdr/releases/latest --jq .tag_name)
+          [[ $latest =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "ignoring $latest"; latest=; }
+          current=v$(sed -n 's/^pkgver=//p' PKGBUILD)
+          published=$(gh release view repo --json assets --jq '.assets[].name' 2>/dev/null | grep -c '\.pkg\.tar\.zst$' || true)
+          echo "latest=$latest current=$current published=$published"
+          if [[ -n $latest && $latest != "$current" ]]; then
+            echo "rebase=$latest" >> "$GITHUB_OUTPUT"; echo "build=1" >> "$GITHUB_OUTPUT"
+          elif [[ $GITHUB_EVENT_NAME != schedule || $published == 0 ]]; then
+            echo "build=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rebase patches
+        if: steps.decide.outputs.rebase
+        run: scripts/rebase.sh "${{ steps.decide.outputs.rebase }}"
+
+      - name: Build and test
+        if: steps.decide.outputs.build
+        run: scripts/build.sh
+
+      - name: Commit rebased patches
+        if: steps.decide.outputs.rebase
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A patches PKGBUILD
+          git commit -m "Rebase onto herdr ${{ steps.decide.outputs.rebase }}"
+          git push origin HEAD:main
+
+      - name: Publish
+        if: steps.decide.outputs.build
+        run: |
+          gh release view repo >/dev/null 2>&1 || \
+            gh release create repo --title "pacman repo" --notes "Rolling pacman repository. See README."
+          gh release upload repo out/* --clobber
+          for a in $(gh release view repo --json assets --jq '.assets[].name'); do
+            [[ -e out/$a ]] || gh release delete-asset repo "$a" --yes
+          done
+
+      - name: Report failure
+        if: failure()
+        run: |
+          title="Release failed: ${{ steps.decide.outputs.rebase || 'rebuild' }}"
+          gh issue list --state open --search "$title in:title" --json number --jq '.[].number' | grep -q . ||
+            gh issue create --title "$title" --body "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID. Nothing was published; the installed package stays as it is."
+
+  # GitHub turns scheduled workflows off after 60 days without commits.
+  keepalive:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/enable"
+        env:
+          GH_TOKEN: ${{ github.token }}

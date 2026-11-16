@@ -1,0 +1,7 @@
+out/
+src/
+pkg/
+herdr/
+*.pkg.tar.*
+*.tar.xz
+build.log

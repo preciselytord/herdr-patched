@@ -1,0 +1,1536 @@
+From 8454c72e5edb5e9edb2a8884b8333dce4f7a501c Mon Sep 17 00:00:00 2001
+From: ARRRRNY <ahmettok@gmail.com>
+Date: Wed, 7 Oct 2026 22:30:22 -0700
+Subject: [PATCH] feat: add an external activate-endpoint trigger for the
+ running app
+
+The app's notification-click jump had no external trigger: no CLI or socket
+route could switch the running client shell to another saved machine's pane,
+because `herdr --machine <label> tab focus` only moves the remote server's
+state. Add `herdr app focus [--machine <label-or-id>] (--pane|--tab|--workspace)`
+with a `client.activate_endpoint` API method and an `endpoint.activate.v1`
+client-shell control that mirrors the notification-click jump. Without a
+running shell that accepts the request the command keeps today's server-side
+focus through the `--machine` bridge and reports which path it took.
+
+refs #73
+---
+ src/api/schema.rs                             |   2 +
+ src/api/schema/common.rs                      |  17 +
+ src/api/schema/response.rs                    |   4 +
+ src/api/server.rs                             |   1 +
+ src/cli.rs                                    |   2 +
+ src/cli/app.rs                                | 314 ++++++++++++++++++
+ src/cli/spec.rs                               |  14 +
+ src/cli/target.rs                             |  19 ++
+ src/client/endpoint/control.rs                |  34 ++
+ src/client/handshake.rs                       |   1 +
+ src/client/mod.rs                             |  18 +
+ src/client/shell/endpoints.rs                 |  66 ++++
+ src/client/shell/tests/endpoints.rs           | 186 +++++++++++
+ src/client/shell_runtime.rs                   |  32 ++
+ src/protocol/endpoint.rs                      |  15 +
+ src/server/client_transport.rs                |   6 +
+ src/server/clients.rs                         |   3 +
+ src/server/headless.rs                        |  53 ++-
+ .../headless/tests/activate_endpoint.rs       | 123 +++++++
+ src/server/headless/tests/mod.rs              |  12 +
+ src/server/headless/tests/surface_interest.rs |   5 +
+ tests/cli/app.rs                              |  95 ++++++
+ tests/cli/mod.rs                              |   1 +
+ 23 files changed, 1022 insertions(+), 1 deletion(-)
+ create mode 100644 src/cli/app.rs
+ create mode 100644 src/server/headless/tests/activate_endpoint.rs
+ create mode 100644 tests/cli/app.rs
+
+diff --git a/src/api/schema.rs b/src/api/schema.rs
+index 439ed331..20fc8be9 100644
+--- a/src/api/schema.rs
++++ b/src/api/schema.rs
+@@ -71,6 +71,8 @@ pub enum Method {
+     ClientWindowTitleSet(ClientWindowTitleSetParams),
+     #[serde(rename = "client.window_title.clear")]
+     ClientWindowTitleClear(EmptyParams),
++    #[serde(rename = "client.activate_endpoint")]
++    ClientActivateEndpoint(ClientActivateEndpointParams),
+     #[serde(rename = "client_shell.surface.set")]
+     ClientShellSurfaceSet(ClientShellSurfaceSetParams),
+     #[serde(rename = "session.snapshot")]
+diff --git a/src/api/schema/common.rs b/src/api/schema/common.rs
+index bf0d7caf..64b56123 100644
+--- a/src/api/schema/common.rs
++++ b/src/api/schema/common.rs
+@@ -67,6 +67,23 @@ pub struct ClientShellSurfaceSetParams {
+     pub active: bool,
+ }
+ 
++/// Asks a running client shell to switch to a saved machine and focus a target there.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
++pub struct ClientActivateEndpointParams {
++    /// Saved machine label or profile ID.
++    pub machine: String,
++    pub target: ClientActivateEndpointTarget,
++}
++
++/// Focus target inside the machine a client shell is asked to activate.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
++#[serde(rename_all = "snake_case", tag = "kind", content = "id")]
++pub enum ClientActivateEndpointTarget {
++    Workspace(String),
++    Tab(String),
++    Pane(String),
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+ #[serde(rename_all = "snake_case")]
+ pub enum SplitDirection {
+diff --git a/src/api/schema/response.rs b/src/api/schema/response.rs
+index e92e4952..408e86af 100644
+--- a/src/api/schema/response.rs
++++ b/src/api/schema/response.rs
+@@ -202,6 +202,10 @@ pub enum ResponseResult {
+         changed: bool,
+         reason: ClientWindowTitleReason,
+     },
++    ClientActivateEndpoint {
++        /// Whether a running client shell that understands the request received it.
++        delivered: bool,
++    },
+     IntegrationList {
+         integrations: Vec<super::integrations::IntegrationInfo>,
+     },
+diff --git a/src/api/server.rs b/src/api/server.rs
+index 0a4cfa66..b4fd93bc 100644
+--- a/src/api/server.rs
++++ b/src/api/server.rs
+@@ -616,6 +616,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
+         Method::CommandInvoke(_) => "command.invoke",
+         Method::ClientWindowTitleSet(_) => "client.window_title.set",
+         Method::ClientWindowTitleClear(_) => "client.window_title.clear",
++        Method::ClientActivateEndpoint(_) => "client.activate_endpoint",
+         Method::ClientShellSurfaceSet(_) => "client_shell.surface.set",
+         Method::SessionSnapshot(_) => "session.snapshot",
+         Method::WorkspaceCreate(_) => "workspace.create",
+diff --git a/src/cli.rs b/src/cli.rs
+index 3dbdceaf..dfc39c01 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -24,6 +24,7 @@ macro_rules! println {
+ 
+ mod agent;
+ mod api;
++mod app;
+ mod completion;
+ mod integration;
+ mod machine;
+@@ -115,6 +116,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
+             exit_code
+         }
+         "api" => api::run_api_command(&args[2..])?,
++        "app" => app::run_app_command(&args[2..])?,
+         "status" => status::run_status_command(&args[2..])?,
+         "completion" | "completions" => completion::run_completion_command(&args[2..])?,
+         "config" => run_config_command(&args[2..])?,
+diff --git a/src/cli/app.rs b/src/cli/app.rs
+new file mode 100644
+index 00000000..22f332ce
+--- /dev/null
++++ b/src/cli/app.rs
+@@ -0,0 +1,314 @@
++//! `herdr app focus` — jump the running client shell to a saved machine's target.
++//!
++//! The jump itself belongs to the client shell: only it can switch the endpoint
++//! it presents. This command asks the local server to forward the request to a
++//! running shell (`client.activate_endpoint`) and keeps today's server-side
++//! focus as the fallback when no shell accepts it.
++
++use crate::api::schema::{
++    ClientActivateEndpointParams, ClientActivateEndpointTarget, Method, PaneTarget, Request,
++    TabTarget, WorkspaceTarget,
++};
++use crate::client::endpoint::EndpointCatalog;
++
++pub(super) const APP_FOCUS_USAGE: &str =
++    "usage: herdr app focus [--machine <label-or-id>] (--pane <id> | --tab <id> | --workspace <id>)";
++
++pub(super) const FOCUSED_APP: &str = "focused (app)";
++pub(super) const FOCUSED_SERVER_SIDE: &str = "focused (server-side)";
++pub(super) const FOCUSED_LOCAL: &str = "focused (local)";
++
++pub(super) fn run_app_command(args: &[String]) -> std::io::Result<i32> {
++    let Some(subcommand) = args.first().map(String::as_str) else {
++        print_app_help();
++        return Ok(2);
++    };
++
++    match subcommand {
++        "focus" => app_focus(&args[1..]),
++        "help" | "--help" | "-h" => {
++            print_app_help();
++            Ok(0)
++        }
++        _ => {
++            print_app_help();
++            Ok(2)
++        }
++    }
++}
++
++struct FocusRequest {
++    machine: Option<String>,
++    target: ClientActivateEndpointTarget,
++}
++
++fn parse_focus_args(args: &[String]) -> Result<FocusRequest, String> {
++    let mut machine = None;
++    let mut target = None;
++    let mut index = 0;
++    while index < args.len() {
++        let flag = args[index].as_str();
++        match flag {
++            "--machine" | "--pane" | "--tab" | "--workspace" => {
++                let value = args
++                    .get(index + 1)
++                    .ok_or_else(|| format!("missing value for {flag}"))?;
++                if value.starts_with('-') {
++                    return Err(format!("missing value for {flag}"));
++                }
++                match flag {
++                    "--machine" => {
++                        if machine.is_some() {
++                            return Err("--machine can only be specified once".into());
++                        }
++                        if value.trim().is_empty() {
++                            return Err(
++                                "--machine requires a saved machine label or profile ID".into()
++                            );
++                        }
++                        machine = Some(value.clone());
++                    }
++                    "--pane" | "--tab" | "--workspace" => {
++                        if target.is_some() {
++                            return Err(
++                                "specify exactly one of --pane, --tab, or --workspace".into()
++                            );
++                        }
++                        target = Some(match flag {
++                            "--pane" => ClientActivateEndpointTarget::Pane(value.clone()),
++                            "--tab" => ClientActivateEndpointTarget::Tab(value.clone()),
++                            _ => ClientActivateEndpointTarget::Workspace(value.clone()),
++                        });
++                    }
++                    _ => unreachable!("matched flag"),
++                }
++                index += 2;
++            }
++            other => return Err(format!("unknown option: {other}")),
++        }
++    }
++    let target =
++        target.ok_or_else(|| "specify one of --pane, --tab, or --workspace".to_string())?;
++    Ok(FocusRequest { machine, target })
++}
++
++fn focus_method(target: &ClientActivateEndpointTarget) -> Method {
++    match target {
++        ClientActivateEndpointTarget::Workspace(workspace_id) => {
++            Method::WorkspaceFocus(WorkspaceTarget {
++                workspace_id: workspace_id.clone(),
++            })
++        }
++        ClientActivateEndpointTarget::Tab(tab_id) => Method::TabFocus(TabTarget {
++            tab_id: tab_id.clone(),
++        }),
++        ClientActivateEndpointTarget::Pane(pane_id) => Method::PaneFocus(PaneTarget {
++            pane_id: pane_id.clone(),
++        }),
++    }
++}
++
++fn probe_method(target: &ClientActivateEndpointTarget) -> Method {
++    match target {
++        ClientActivateEndpointTarget::Workspace(workspace_id) => {
++            Method::WorkspaceGet(WorkspaceTarget {
++                workspace_id: workspace_id.clone(),
++            })
++        }
++        ClientActivateEndpointTarget::Tab(tab_id) => Method::TabGet(TabTarget {
++            tab_id: tab_id.clone(),
++        }),
++        ClientActivateEndpointTarget::Pane(pane_id) => Method::PaneGet(PaneTarget {
++            pane_id: pane_id.clone(),
++        }),
++    }
++}
++
++/// Whether a running client shell accepted the request to jump.
++pub(super) fn activation_delivered(response: &serde_json::Value) -> bool {
++    response["result"]["delivered"].as_bool() == Some(true)
++}
++
++fn app_focus(args: &[String]) -> std::io::Result<i32> {
++    let request = match parse_focus_args(args) {
++        Ok(request) => request,
++        Err(message) => {
++            eprintln!("{message}");
++            eprintln!("{APP_FOCUS_USAGE}");
++            return Ok(2);
++        }
++    };
++
++    let Some(selector) = request.machine.clone() else {
++        return local_focus(&request.target);
++    };
++
++    let profiles = match EndpointCatalog::load_profiles() {
++        Ok(profiles) => profiles,
++        Err(error) => {
++            eprintln!("error: {error}");
++            return Ok(1);
++        }
++    };
++    let profile = match super::target::resolve_machine(&profiles, &selector) {
++        Ok(profile) => profile.clone(),
++        Err(error) => {
++            eprintln!("error: {error}");
++            return Ok(2);
++        }
++    };
++
++    // The machine owns its public ids, so prove the target exists there before
++    // either path acts; an unresolvable id must fail here, not silently no-op.
++    let validation = super::target::with_machine_profile(profile.clone(), || {
++        super::send_request(&Request {
++            id: "cli:app:focus:validate".into(),
++            method: probe_method(&request.target),
++        })
++    });
++    match validation {
++        Ok(response) if response.get("error").is_none() => {}
++        Ok(response) => {
++            eprintln!("{}", serde_json::to_string(&response).unwrap());
++            return Ok(1);
++        }
++        Err(error) => {
++            eprintln!("error: {error}");
++            return Ok(1);
++        }
++    }
++
++    let activation = Request {
++        id: "cli:app:focus".into(),
++        method: Method::ClientActivateEndpoint(ClientActivateEndpointParams {
++            machine: selector,
++            target: request.target.clone(),
++        }),
++    };
++    // No running shell (or one that cannot act on the request) falls through to
++    // server-side focus, so an unreachable app is never an error by itself.
++    if super::send_request_unchecked(&activation)
++        .is_ok_and(|response| activation_delivered(&response))
++    {
++        println!("{FOCUSED_APP}");
++        return Ok(0);
++    }
++
++    let response = super::target::with_machine_profile(profile, || {
++        super::send_request(&Request {
++            id: "cli:app:focus:server-side".into(),
++            method: focus_method(&request.target),
++        })
++    })?;
++    if response.get("error").is_some() {
++        eprintln!("{}", serde_json::to_string(&response).unwrap());
++        return Ok(1);
++    }
++    println!("{FOCUSED_SERVER_SIDE}");
++    Ok(0)
++}
++
++fn local_focus(target: &ClientActivateEndpointTarget) -> std::io::Result<i32> {
++    let response = super::send_request(&Request {
++        id: "cli:app:focus".into(),
++        method: focus_method(target),
++    })?;
++    if response.get("error").is_some() {
++        eprintln!("{}", serde_json::to_string(&response).unwrap());
++        return Ok(1);
++    }
++    println!("{FOCUSED_LOCAL}");
++    Ok(0)
++}
++
++fn print_app_help() {
++    eprintln!("herdr app commands:");
++    eprintln!(
++        "  herdr app focus [--machine <label-or-id>] (--pane <id> | --tab <id> | --workspace <id>)"
++    );
++    eprintln!("    Jump a running app to the target. With --machine it switches the app");
++    eprintln!("    to that saved machine; without one it focuses the local target.");
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn args(values: &[&str]) -> Vec<String> {
++        values.iter().map(|value| (*value).into()).collect()
++    }
++
++    #[test]
++    fn focus_args_require_exactly_one_target() {
++        for input in [
++            args(&[]),
++            args(&["--machine", "mac"]),
++            args(&["--pane", "w1:p1", "--tab", "w1:t1"]),
++            args(&["--workspace", "w1", "--pane", "w1:p1"]),
++        ] {
++            assert!(parse_focus_args(&input).is_err(), "{input:?}");
++        }
++
++        let request = parse_focus_args(&args(&["--pane", "w1:p1"])).unwrap();
++        assert_eq!(request.machine, None);
++        assert_eq!(
++            request.target,
++            ClientActivateEndpointTarget::Pane("w1:p1".into())
++        );
++
++        let request = parse_focus_args(&args(&["--machine", "mac", "--tab", "w1:t1"])).unwrap();
++        assert_eq!(request.machine.as_deref(), Some("mac"));
++        assert_eq!(
++            request.target,
++            ClientActivateEndpointTarget::Tab("w1:t1".into())
++        );
++    }
++
++    #[test]
++    fn focus_args_reject_missing_values_and_unknown_options() {
++        for input in [
++            args(&["--machine"]),
++            args(&["--pane"]),
++            args(&["--machine", "--pane", "w1:p1"]),
++            args(&["--pane", "w1:p1", "--machine"]),
++            args(&["--machine", "mac", "--pane", "w1:p1", "--machine", "other"]),
++            args(&["--machine", "mac", "--pane", "w1:p1", "--json"]),
++        ] {
++            assert!(parse_focus_args(&input).is_err(), "{input:?}");
++        }
++    }
++
++    #[test]
++    fn focus_targets_map_to_their_focus_and_probe_methods() {
++        let targets = [
++            ClientActivateEndpointTarget::Workspace("w1".into()),
++            ClientActivateEndpointTarget::Tab("w1:t1".into()),
++            ClientActivateEndpointTarget::Pane("w1:p1".into()),
++        ];
++        for target in targets {
++            let focus = focus_method(&target);
++            let probe = probe_method(&target);
++            let expected = match &target {
++                ClientActivateEndpointTarget::Workspace(_) => ("workspace.focus", "workspace.get"),
++                ClientActivateEndpointTarget::Tab(_) => ("tab.focus", "tab.get"),
++                ClientActivateEndpointTarget::Pane(_) => ("pane.focus", "pane.get"),
++            };
++            assert_eq!(crate::api::api_method_name(&focus), expected.0);
++            assert_eq!(crate::api::api_method_name(&probe), expected.1);
++        }
++    }
++
++    #[test]
++    fn only_a_delivered_response_counts_as_an_app_jump() {
++        assert!(activation_delivered(
++            &serde_json::json!({"result": {"type": "client_activate_endpoint", "delivered": true}})
++        ));
++        assert!(!activation_delivered(
++            &serde_json::json!({"result": {"type": "client_activate_endpoint", "delivered": false}})
++        ));
++        assert!(!activation_delivered(
++            &serde_json::json!({"error": {"code": "not_implemented", "message": "no"}})
++        ));
++        assert!(!activation_delivered(&serde_json::json!({})));
++    }
++}
+diff --git a/src/cli/spec.rs b/src/cli/spec.rs
+index 9a503a18..e4fdd187 100644
+--- a/src/cli/spec.rs
++++ b/src/cli/spec.rs
+@@ -40,6 +40,7 @@ pub(super) fn command() -> Command {
+         .subcommand(workspace_command())
+         .subcommand(worktree_command())
+         .subcommand(tab_command())
++        .subcommand(app_command())
+         .subcommand(notification_command())
+         .subcommand(agent_command())
+         .subcommand(pane_command())
+@@ -302,6 +303,19 @@ fn tab_command() -> Command {
+         .subcommand(id_command("close", "tab_id", "Close a tab"))
+ }
+ 
++fn app_command() -> Command {
++    Command::new("app")
++        .about("Jump a running app to a target")
++        .subcommand(
++            Command::new("focus")
++                .about("Focus a pane, tab, or workspace in the running app")
++                .arg(option("machine", "LABEL-OR-ID"))
++                .arg(option("pane", "PANE_ID"))
++                .arg(option("tab", "TAB_ID"))
++                .arg(option("workspace", "WORKSPACE_ID")),
++        )
++}
++
+ fn notification_command() -> Command {
+     Command::new("notification")
+         .about("Show Herdr notifications")
+diff --git a/src/cli/target.rs b/src/cli/target.rs
+index 9c8b9c80..56db41b6 100644
+--- a/src/cli/target.rs
++++ b/src/cli/target.rs
+@@ -315,6 +315,25 @@ fn validate_machine_command(args: &[String]) -> Result<(), String> {
+     }
+ }
+ 
++/// Routes API calls to a saved machine for the duration of `run`, bridging lazily
++/// on first use. Tests that pre-seed a client override keep talking to it.
++pub(super) fn with_machine_profile<T>(profile: SavedSshEndpoint, run: impl FnOnce() -> T) -> T {
++    let _scope = TARGET.with(|target| {
++        #[cfg(test)]
++        let client_override = target
++            .borrow()
++            .as_ref()
++            .and_then(|existing| existing.client_override.clone());
++        TargetScope(target.replace(Some(MachineTarget {
++            profile,
++            bridge: None,
++            #[cfg(test)]
++            client_override,
++        })))
++    });
++    run()
++}
++
+ #[cfg(test)]
+ pub(super) fn with_test_client<T>(client: ApiClient, run: impl FnOnce() -> T) -> T {
+     let _scope = TARGET.with(|target| {
+diff --git a/src/client/endpoint/control.rs b/src/client/endpoint/control.rs
+index f2fe1b76..f26eebf9 100644
+--- a/src/client/endpoint/control.rs
++++ b/src/client/endpoint/control.rs
+@@ -8,6 +8,7 @@ pub(crate) struct DecodedAgentViewProjection {
+ 
+ pub(crate) enum EndpointControlMessage {
+     HealthPong,
++    ActivateEndpoint(Box<crate::api::schema::ClientActivateEndpointParams>),
+     AgentViewProjection(DecodedAgentViewProjection),
+     AgentCompletions(crate::protocol::endpoint::EndpointAgentCompletions),
+     Snapshot(Box<crate::protocol::ClientShellSnapshot>),
+@@ -21,6 +22,11 @@ pub(crate) fn decode_endpoint_control(
+     if kind == crate::protocol::endpoint::HEALTH_PONG_KIND {
+         return Ok(EndpointControlMessage::HealthPong);
+     }
++    if kind == crate::protocol::endpoint::ACTIVATE_ENDPOINT_KIND {
++        return Ok(serde_json::from_str(data)
++            .map(|params| EndpointControlMessage::ActivateEndpoint(Box::new(params)))
++            .unwrap_or(EndpointControlMessage::Ignored));
++    }
+     if kind == crate::protocol::endpoint::AGENT_COMPLETIONS_KIND {
+         return Ok(serde_json::from_str(data)
+             .map(EndpointControlMessage::AgentCompletions)
+@@ -83,6 +89,34 @@ mod tests {
+         ));
+     }
+ 
++    #[test]
++    fn activate_endpoint_control_round_trips_and_ignores_malformed_payloads() {
++        let params = crate::api::schema::ClientActivateEndpointParams {
++            machine: "mac-mini".into(),
++            target: crate::api::schema::ClientActivateEndpointTarget::Pane("w1D:p4Y".into()),
++        };
++        let crate::protocol::ServerMessage::EndpointControl { kind, data } =
++            crate::protocol::endpoint::activate_endpoint_message(&params).unwrap()
++        else {
++            panic!("expected activate endpoint control");
++        };
++        assert_eq!(kind, crate::protocol::endpoint::ACTIVATE_ENDPOINT_KIND);
++        let EndpointControlMessage::ActivateEndpoint(decoded) =
++            decode_endpoint_control(&kind, &data).unwrap()
++        else {
++            panic!("expected activate endpoint request");
++        };
++        assert_eq!(*decoded, params);
++        assert!(matches!(
++            decode_endpoint_control(
++                crate::protocol::endpoint::ACTIVATE_ENDPOINT_KIND,
++                "not json"
++            )
++            .unwrap(),
++            EndpointControlMessage::Ignored
++        ));
++    }
++
+     #[test]
+     fn completion_guard_optional_control_round_trips_without_changing_snapshot_codec() {
+         let projection = crate::protocol::endpoint::EndpointAgentCompletions {
+diff --git a/src/client/handshake.rs b/src/client/handshake.rs
+index 75241ad1..0901490f 100644
+--- a/src/client/handshake.rs
++++ b/src/client/handshake.rs
+@@ -213,6 +213,7 @@ pub(super) fn do_handshake(
+             surface_codecs: vec![SURFACE_CODEC_V1.into()],
+             input_codecs: vec![INPUT_CODEC_V1.into()],
+             blob_codecs: vec![BLOB_CODEC_V1.into()],
++            activate_endpoint: true,
+         };
+         ClientMessage::EndpointControl {
+             kind: ENDPOINT_HELLO_KIND.into(),
+diff --git a/src/client/mod.rs b/src/client/mod.rs
+index f55db195..9a699636 100644
+--- a/src/client/mod.rs
++++ b/src/client/mod.rs
+@@ -2091,6 +2091,24 @@ async fn run_client_loop(
+                         }
+                         let snapshot = match endpoint::decode_endpoint_control(&kind, &data) {
+                             Ok(endpoint::EndpointControlMessage::HealthPong) => continue,
++                            Ok(endpoint::EndpointControlMessage::ActivateEndpoint(params)) => {
++                                // Only the local server owns the shell's presentation, so a
++                                // remote endpoint cannot redirect this client's view.
++                                if endpoint_id.is_local()
++                                    && apply_activate_endpoint_request(
++                                        &mut state,
++                                        &params,
++                                        &mut write_stream,
++                                        &mut pending_activation,
++                                        &mut endpoint_commands,
++                                        &mut prefix_input_source,
++                                        &mut scheduled_activation,
++                                    )?
++                                {
++                                    return Ok(());
++                                }
++                                continue;
++                            }
+                             Ok(endpoint::EndpointControlMessage::AgentViewProjection(
+                                 projection,
+                             )) => {
+diff --git a/src/client/shell/endpoints.rs b/src/client/shell/endpoints.rs
+index 9e71d00a..4e242788 100644
+--- a/src/client/shell/endpoints.rs
++++ b/src/client/shell/endpoints.rs
+@@ -474,6 +474,72 @@ impl ClientShellState {
+         &self.active_endpoint_id == endpoint_id
+     }
+ 
++    /// Resolves a saved-machine selector (profile ID or label) to an attached endpoint.
++    pub(crate) fn endpoint_for_machine_selector(&self, selector: &str) -> Option<ClientEndpointId> {
++        let selector = selector.trim();
++        if selector.is_empty() {
++            return None;
++        }
++        if let Ok(profile_id) = crate::client::endpoint::ProfileId::parse(selector) {
++            let endpoint_id = ClientEndpointId::Ssh(profile_id);
++            return self
++                .endpoints
++                .iter()
++                .any(|endpoint| endpoint.endpoint_id == endpoint_id)
++                .then_some(endpoint_id);
++        }
++        let mut matches = self
++            .endpoints
++            .iter()
++            .filter(|endpoint| endpoint.label == selector);
++        let endpoint = matches.next()?;
++        if matches.next().is_some() {
++            return None;
++        }
++        Some(endpoint.endpoint_id.clone())
++    }
++
++    /// Applies an external activate-endpoint request, mirroring the notification-click jump.
++    pub(crate) fn activate_endpoint_request(
++        &mut self,
++        params: &crate::api::schema::ClientActivateEndpointParams,
++    ) -> ClientShellInput {
++        let mut outcome = ClientShellInput::default();
++        let Some(endpoint_id) = self.endpoint_for_machine_selector(&params.machine) else {
++            tracing::debug!(
++                machine = %params.machine,
++                "activate endpoint request names an unknown or ambiguous machine"
++            );
++            return outcome;
++        };
++        let target = match &params.target {
++            crate::api::schema::ClientActivateEndpointTarget::Workspace(workspace_id) => {
++                ClientEndpointFocusTarget::Workspace(workspace_id.clone())
++            }
++            crate::api::schema::ClientActivateEndpointTarget::Tab(tab_id) => {
++                ClientEndpointFocusTarget::Tab(tab_id.clone())
++            }
++            crate::api::schema::ClientActivateEndpointTarget::Pane(pane_id) => {
++                ClientEndpointFocusTarget::Pane(pane_id.clone())
++            }
++        };
++        if !self.endpoint_is_online(&endpoint_id) {
++            let label = self.endpoint_label(&endpoint_id).to_owned();
++            self.receive_endpoint_unavailable(format!("{label} is unavailable"));
++            outcome.repaint = true;
++            return outcome;
++        }
++        if endpoint_id == self.active_endpoint_id {
++            outcome.actions = self.focus_endpoint_target(target);
++        } else {
++            outcome.actions.push(ClientShellAction::ActivateEndpoint {
++                endpoint_id,
++                target: Some(target),
++            });
++        }
++        outcome
++    }
++
+     pub(crate) fn multi_endpoint_active(&self) -> bool {
+         self.endpoints.len() > 1
+     }
+diff --git a/src/client/shell/tests/endpoints.rs b/src/client/shell/tests/endpoints.rs
+index c0a7e523..d8d65232 100644
+--- a/src/client/shell/tests/endpoints.rs
++++ b/src/client/shell/tests/endpoints.rs
+@@ -2839,3 +2839,189 @@ fn navigator_foreign_workspace_heading_keeps_the_workspace_target() {
+         }] if activated == &endpoint_id && workspace_id == "ws_1"
+     ));
+ }
++
++fn activate_request(
++    machine: &str,
++    target: crate::api::schema::ClientActivateEndpointTarget,
++) -> crate::api::schema::ClientActivateEndpointParams {
++    crate::api::schema::ClientActivateEndpointParams {
++        machine: machine.into(),
++        target,
++    }
++}
++
++#[test]
++fn activate_endpoint_request_switches_machine_and_focuses_the_target() {
++    use crate::api::schema::ClientActivateEndpointTarget;
++
++    let (mut state, remote) = state_with_remote();
++    for target in [
++        ClientActivateEndpointTarget::Pane("pane_1".into()),
++        ClientActivateEndpointTarget::Tab("tab_1".into()),
++        ClientActivateEndpointTarget::Workspace("ws_1".into()),
++    ] {
++        let expected = match &target {
++            ClientActivateEndpointTarget::Pane(pane_id) => {
++                ClientEndpointFocusTarget::Pane(pane_id.clone())
++            }
++            ClientActivateEndpointTarget::Tab(tab_id) => {
++                ClientEndpointFocusTarget::Tab(tab_id.clone())
++            }
++            ClientActivateEndpointTarget::Workspace(workspace_id) => {
++                ClientEndpointFocusTarget::Workspace(workspace_id.clone())
++            }
++        };
++        let outcome = state.activate_endpoint_request(&activate_request("Build", target));
++        assert!(
++            matches!(
++                outcome.actions.as_slice(),
++                [ClientShellAction::ActivateEndpoint { endpoint_id, target: Some(target) }]
++                    if endpoint_id == &remote && target == &expected
++            ),
++            "{:?}",
++            outcome.actions
++        );
++    }
++}
++
++#[test]
++fn activate_endpoint_request_accepts_profile_ids() {
++    use crate::api::schema::ClientActivateEndpointTarget;
++
++    let (mut state, remote) = state_with_remote();
++    let ClientEndpointId::Ssh(profile_id) = &remote else {
++        panic!("expected an SSH endpoint");
++    };
++    let outcome = state.activate_endpoint_request(&activate_request(
++        profile_id.as_str(),
++        ClientActivateEndpointTarget::Pane("pane_1".into()),
++    ));
++    assert!(matches!(
++        outcome.actions.as_slice(),
++        [ClientShellAction::ActivateEndpoint { endpoint_id, .. }] if endpoint_id == &remote
++    ));
++}
++
++#[test]
++fn activate_endpoint_request_focuses_in_place_on_the_active_machine() {
++    use crate::api::schema::ClientActivateEndpointTarget;
++
++    let (mut state, remote) = state_with_remote();
++    assert!(state.activate_endpoint_projection(&remote));
++    let outcome = state.activate_endpoint_request(&activate_request(
++        "Build",
++        ClientActivateEndpointTarget::Tab("tab_1".into()),
++    ));
++    assert!(matches!(
++        outcome.actions.as_slice(),
++        [ClientShellAction::Endpoint { endpoint_id, request, .. }]
++            if endpoint_id == &remote
++                && matches!(
++                    &request.method,
++                    crate::api::schema::Method::TabFocus(target) if target.tab_id == "tab_1"
++                )
++    ));
++}
++
++#[test]
++fn activate_endpoint_request_reports_an_offline_machine_without_navigating() {
++    use crate::api::schema::ClientActivateEndpointTarget;
++
++    let (mut state, remote) = state_with_remote();
++    state.set_endpoint_status(&remote, ClientEndpointStatus::Reconnecting);
++    let outcome = state.activate_endpoint_request(&activate_request(
++        "Build",
++        ClientActivateEndpointTarget::Pane("pane_1".into()),
++    ));
++    assert!(outcome.actions.is_empty());
++    assert!(outcome.repaint);
++    let notice = state
++        .visible_endpoint_notice
++        .take()
++        .expect("endpoint notice");
++    assert!(
++        notice.body.contains("Build is unavailable"),
++        "{}",
++        notice.body
++    );
++}
++
++#[test]
++fn activate_endpoint_request_ignores_unknown_and_ambiguous_machines() {
++    use crate::api::schema::ClientActivateEndpointTarget;
++
++    let (mut state, _remote) = state_with_remote();
++    let unknown = state.activate_endpoint_request(&activate_request(
++        "missing",
++        ClientActivateEndpointTarget::Pane("pane_1".into()),
++    ));
++    assert!(unknown.actions.is_empty());
++    assert!(!unknown.repaint);
++
++    let duplicate = SavedSshEndpoint::new("Build", "other@build.example", "agents").unwrap();
++    state.set_endpoint_catalog(&[remote_profile(), duplicate]);
++    let ambiguous = state.activate_endpoint_request(&activate_request(
++        "Build",
++        ClientActivateEndpointTarget::Pane("pane_1".into()),
++    ));
++    assert!(ambiguous.actions.is_empty());
++    assert!(!ambiguous.repaint);
++}
++
++#[derive(Clone)]
++struct GlueEndpointTransport(std::sync::Arc<std::sync::Mutex<Vec<crate::protocol::ClientMessage>>>);
++
++impl crate::client::endpoint::EndpointTransport for GlueEndpointTransport {
++    fn send(&mut self, message: &crate::protocol::ClientMessage) -> std::io::Result<()> {
++        self.0.lock().unwrap().push(message.clone());
++        Ok(())
++    }
++}
++
++#[test]
++fn activate_endpoint_control_schedules_the_endpoint_switch_for_a_live_shell() {
++    use crate::api::schema::{ClientActivateEndpointParams, ClientActivateEndpointTarget};
++
++    let mut state = crate::client::ClientState::test_new();
++    let profile = remote_profile();
++    let remote = ClientEndpointId::Ssh(profile.id.clone());
++    {
++        let shell = state.shell.as_mut().expect("shell mode");
++        shell.set_endpoint_catalog(std::slice::from_ref(&profile));
++        shell.set_endpoint_status(&remote, ClientEndpointStatus::Online);
++        shell.set_endpoint_snapshot(&remote, Box::new(snapshot()));
++    }
++    let mut endpoints = crate::client::endpoint::EndpointRegistry::new(
++        GlueEndpointTransport(std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))),
++        1,
++        crate::client::endpoint::EndpointNegotiation::new(Vec::new(), Vec::new()),
++    );
++    let mut pending_activation = None;
++    let mut endpoint_commands = crate::client::endpoint_commands::EndpointCommands::default();
++    let mut prefix_input_source = crate::platform::RealPrefixInputSource::default();
++    let mut scheduled_activation = None;
++
++    let detached = crate::client::shell_runtime::apply_activate_endpoint_request(
++        &mut state,
++        &ClientActivateEndpointParams {
++            machine: "Build".into(),
++            target: ClientActivateEndpointTarget::Pane("pane_1".into()),
++        },
++        &mut endpoints,
++        &mut pending_activation,
++        &mut endpoint_commands,
++        &mut prefix_input_source,
++        &mut scheduled_activation,
++    )
++    .unwrap();
++
++    assert!(!detached);
++    assert!(matches!(
++        scheduled_activation,
++        Some(crate::client::ClientLoopEvent::ActivateEndpoint {
++            endpoint_id,
++            target: Some(ClientEndpointFocusTarget::Pane(pane_id)),
++            force: false,
++        }) if endpoint_id == remote && pane_id == "pane_1"
++    ));
++}
+diff --git a/src/client/shell_runtime.rs b/src/client/shell_runtime.rs
+index 66a41864..af4d1354 100644
+--- a/src/client/shell_runtime.rs
++++ b/src/client/shell_runtime.rs
+@@ -512,6 +512,38 @@ pub(super) fn rollback_endpoint_activation(
+     }
+ }
+ 
++/// Applies an external activate-endpoint request from the local server.
++///
++/// Returns true when the request detached the client.
++pub(super) fn apply_activate_endpoint_request(
++    state: &mut ClientState,
++    params: &crate::api::schema::ClientActivateEndpointParams,
++    endpoints: &mut endpoint::EndpointRegistry,
++    pending_activation: &mut Option<endpoint::PendingEndpointActivation>,
++    endpoint_commands: &mut endpoint_commands::EndpointCommands,
++    prefix_input_source: &mut impl crate::platform::PrefixInputSource,
++    scheduled_activation: &mut Option<ClientLoopEvent>,
++) -> Result<bool, ClientError> {
++    let Some(shell) = state.shell.as_mut() else {
++        return Ok(false);
++    };
++    let outcome = shell.activate_endpoint_request(params);
++    let frame = outcome
++        .repaint
++        .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
++        .flatten();
++    finish_client_shell_input(
++        state,
++        outcome,
++        frame,
++        endpoints,
++        pending_activation,
++        endpoint_commands,
++        prefix_input_source,
++        scheduled_activation,
++    )
++}
++
+ pub(super) fn handle_endpoint_disconnect(
+     state: &mut ClientState,
+     endpoints: &mut endpoint::EndpointRegistry,
+diff --git a/src/protocol/endpoint.rs b/src/protocol/endpoint.rs
+index d1e577c4..d633926a 100644
+--- a/src/protocol/endpoint.rs
++++ b/src/protocol/endpoint.rs
+@@ -31,6 +31,7 @@ pub const AGENT_VIEW_PROJECTION_CAPABILITY: &str = "agent_view_projection";
+ pub const AGENT_VIEW_PROJECTION_KIND: &str = "endpoint.agent-view.v1";
+ pub const AGENT_COMPLETIONS_CAPABILITY: &str = "agent_completions";
+ pub const AGENT_COMPLETIONS_KIND: &str = "endpoint.agent-completions.v1";
++pub const ACTIVATE_ENDPOINT_KIND: &str = "endpoint.activate.v1";
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct EndpointAgentCompletions {
+@@ -72,6 +73,9 @@ pub struct EndpointClientHello {
+     pub input_codecs: Vec<String>,
+     #[serde(default)]
+     pub blob_codecs: Vec<String>,
++    /// Accept an activate-endpoint request and jump this shell to the named machine.
++    #[serde(default)]
++    pub activate_endpoint: bool,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+@@ -138,6 +142,16 @@ pub fn agent_view_projection_message(
+     })
+ }
+ 
++/// Asks a client shell to switch to a saved machine and focus a target there.
++pub fn activate_endpoint_message(
++    params: &crate::api::schema::ClientActivateEndpointParams,
++) -> serde_json::Result<ServerMessage> {
++    Ok(ServerMessage::EndpointControl {
++        kind: ACTIVATE_ENDPOINT_KIND.into(),
++        data: serde_json::to_string(params)?,
++    })
++}
++
+ impl EndpointClientHello {
+     pub fn supports_required_codecs(&self) -> bool {
+         self.snapshot_codecs
+@@ -219,6 +233,7 @@ mod tests {
+             surface_codecs: vec![SURFACE_CODEC_V1.into()],
+             input_codecs: vec![INPUT_CODEC_V1.into()],
+             blob_codecs: vec![BLOB_CODEC_V1.into()],
++            activate_endpoint: false,
+         }
+     }
+ 
+diff --git a/src/server/client_transport.rs b/src/server/client_transport.rs
+index 0536fe7e..3b1c9c1b 100644
+--- a/src/server/client_transport.rs
++++ b/src/server/client_transport.rs
+@@ -419,6 +419,7 @@ pub(crate) enum ServerEvent {
+         surface_reuse: bool,
+         surface_delta: bool,
+         surface_scroll: bool,
++        activate_endpoint: bool,
+         writer: ClientWriter,
+     },
+     /// A client sent an input message.
+@@ -787,6 +788,7 @@ pub(crate) fn handle_client_handshake(
+                     hello.surface_reuse,
+                     hello.surface_delta,
+                     hello.surface_scroll,
++                    hello.activate_endpoint,
+                 )),
+             )
+         }
+@@ -884,6 +886,7 @@ pub(crate) fn handle_client_handshake(
+         surface_reuse,
+         surface_delta,
+         surface_scroll,
++        activate_endpoint,
+     )) = shell_options
+     {
+         ServerEvent::ClientShellConnected {
+@@ -900,6 +903,7 @@ pub(crate) fn handle_client_handshake(
+             surface_reuse,
+             surface_delta,
+             surface_scroll,
++            activate_endpoint,
+             writer,
+         }
+     } else {
+@@ -1481,6 +1485,7 @@ mod tests {
+             surface_codecs: vec![crate::protocol::endpoint::SURFACE_CODEC_V1.into()],
+             input_codecs: vec![crate::protocol::endpoint::INPUT_CODEC_V1.into()],
+             blob_codecs: vec![crate::protocol::endpoint::BLOB_CODEC_V1.into()],
++            activate_endpoint: false,
+         };
+         ClientMessage::EndpointControl {
+             kind: ENDPOINT_HELLO_KIND.into(),
+@@ -1995,6 +2000,7 @@ mod tests {
+                 surface_reuse,
+                 surface_delta,
+                 surface_scroll,
++                activate_endpoint: false,
+                 writer,
+             } => {
+                 assert!(!surface_reuse);
+diff --git a/src/server/clients.rs b/src/server/clients.rs
+index 65e875b8..c6f7c217 100644
+--- a/src/server/clients.rs
++++ b/src/server/clients.rs
+@@ -163,6 +163,8 @@ pub(crate) struct ClientConnection {
+     pub(crate) shell_surface_active: bool,
+     /// Whether this shell wants host mouse capture without pane demand.
+     pub(crate) shell_mouse_capture: bool,
++    /// Whether this shell advertised that it acts on activate-endpoint requests.
++    pub(crate) shell_activate_endpoint_supported: bool,
+     /// Last host mouse capture mode sent to this client.
+     pub(crate) host_mouse_capture_active: Option<bool>,
+     /// Last SGR pixel provenance mode sent to this client.
+@@ -255,6 +257,7 @@ impl ClientConnection {
+             shell_deferred_navigation_request_id: None,
+             shell_deferred_navigation_response: None,
+             shell_uses_endpoint_keybindings: false,
++            shell_activate_endpoint_supported: false,
+             writer,
+         }
+     }
+diff --git a/src/server/headless.rs b/src/server/headless.rs
+index cb2c6196..37ea7937 100644
+--- a/src/server/headless.rs
++++ b/src/server/headless.rs
+@@ -1518,6 +1518,39 @@ impl HeadlessServer {
+         sent
+     }
+ 
++    /// Forwards an activate-endpoint request to the client-rendered shells that accept it.
++    fn handle_client_activate_endpoint_api(
++        &mut self,
++        id: String,
++        params: api::schema::ClientActivateEndpointParams,
++    ) -> String {
++        use api::schema::{ErrorBody, ErrorResponse, ResponseResult, SuccessResponse};
++
++        let message = match crate::protocol::endpoint::activate_endpoint_message(&params) {
++            Ok(message) => message,
++            Err(err) => {
++                return serde_json::to_string(&ErrorResponse {
++                    id,
++                    error: ErrorBody {
++                        code: "internal_error".into(),
++                        message: format!("failed to encode activate endpoint request: {err}"),
++                    },
++                })
++                .unwrap_or_else(|_| "{}".to_string());
++            }
++        };
++        // A shell that never advertised the control would ignore it, so it must
++        // not count as delivery; the caller then falls back to server-side focus.
++        let delivered = self.send_to_client_shells_matching(message, |client| {
++            client.shell_activate_endpoint_supported
++        });
++        serde_json::to_string(&SuccessResponse {
++            id,
++            result: ResponseResult::ClientActivateEndpoint { delivered },
++        })
++        .unwrap_or_else(|_| "{}".to_string())
++    }
++
+     fn handle_client_window_title_api(&mut self, id: String, title: Option<String>) -> String {
+         use api::schema::{ClientWindowTitleReason, ResponseResult};
+ 
+@@ -1614,6 +1647,15 @@ impl HeadlessServer {
+ 
+     /// Sends an ephemeral semantic event to every connected client-rendered shell.
+     fn send_to_client_shells(&mut self, msg: ServerMessage) -> bool {
++        self.send_to_client_shells_matching(msg, |_| true)
++    }
++
++    /// Sends a message to the client-rendered shells that accept it.
++    fn send_to_client_shells_matching(
++        &mut self,
++        msg: ServerMessage,
++        accepts: impl Fn(&ClientConnection) -> bool,
++    ) -> bool {
+         let serialized = match Self::frame_server_message(&msg) {
+             Ok(framed) => framed,
+             Err(err) => {
+@@ -1625,7 +1667,8 @@ impl HeadlessServer {
+             .clients
+             .iter()
+             .filter_map(|(&client_id, client)| {
+-                matches!(client.mode, ClientConnectionMode::ClientShell).then_some(client_id)
++                (matches!(client.mode, ClientConnectionMode::ClientShell) && accepts(client))
++                    .then_some(client_id)
+             })
+             .collect::<Vec<_>>();
+         let mut sent = false;
+@@ -1910,6 +1953,7 @@ impl HeadlessServer {
+                 surface_reuse,
+                 surface_delta,
+                 surface_scroll,
++                activate_endpoint,
+                 writer,
+             } => {
+                 if self.handoff_in_progress {
+@@ -1955,6 +1999,7 @@ impl HeadlessServer {
+                 connection.shell_uses_endpoint_keybindings = endpoint_keybindings;
+                 connection.shell_mouse_capture = mouse_capture;
+                 connection.shell_surface_active = surface_active;
++                connection.shell_activate_endpoint_supported = activate_endpoint;
+                 connection.render_state.enable_surface_reuse(surface_reuse);
+                 connection.render_state.enable_surface_delta(surface_delta);
+                 connection
+@@ -2961,6 +3006,12 @@ impl HeadlessServer {
+         }
+ 
+         match &msg.request.method {
++            api::schema::Method::ClientActivateEndpoint(params) => {
++                let response = self
++                    .handle_client_activate_endpoint_api(msg.request.id.clone(), params.clone());
++                let _ = msg.respond_to.send(response);
++                return false;
++            }
+             api::schema::Method::ClientWindowTitleSet(params) => {
+                 let response = self.handle_client_window_title_api(
+                     msg.request.id.clone(),
+diff --git a/src/server/headless/tests/activate_endpoint.rs b/src/server/headless/tests/activate_endpoint.rs
+new file mode 100644
+index 00000000..5b5d7b68
+--- /dev/null
++++ b/src/server/headless/tests/activate_endpoint.rs
+@@ -0,0 +1,123 @@
++use super::*;
++
++fn connect_shell(
++    server: &mut HeadlessServer,
++    client_id: u64,
++    activate_endpoint: bool,
++) -> std::sync::mpsc::Receiver<Vec<u8>> {
++    let (writer, control_rx, _render_rx) = test_client_writer();
++    assert!(
++        server.handle_server_event(ServerEvent::ClientShellConnected {
++            client_id,
++            surface_cols: 80,
++            surface_rows: 24,
++            cell_width_px: 8,
++            cell_height_px: 16,
++            pixel_mouse: false,
++            direct_graphics: false,
++            endpoint_keybindings: false,
++            mouse_capture: false,
++            surface_active: true,
++            surface_reuse: false,
++            surface_delta: false,
++            surface_scroll: false,
++            activate_endpoint,
++            writer,
++        })
++    );
++    control_rx
++}
++
++fn activate_endpoint_request() -> api::schema::Request {
++    api::schema::Request {
++        id: "activate-endpoint".into(),
++        method: api::schema::Method::ClientActivateEndpoint(
++            api::schema::ClientActivateEndpointParams {
++                machine: "mac-mini".into(),
++                target: api::schema::ClientActivateEndpointTarget::Pane("w1D:p4Y".into()),
++            },
++        ),
++    }
++}
++
++fn dispatch(server: &mut HeadlessServer, request: api::schema::Request) -> serde_json::Value {
++    let (respond_to, response_rx) = std::sync::mpsc::channel();
++    server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
++        request,
++        respond_to,
++        response_write_complete: None,
++    });
++    let response = response_rx
++        .recv_timeout(Duration::from_millis(500))
++        .expect("api response");
++    serde_json::from_str(&response).expect("api response json")
++}
++
++fn read_activate_endpoint_control(
++    control_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
++) -> api::schema::ClientActivateEndpointParams {
++    let deadline = std::time::Instant::now() + Duration::from_millis(500);
++    while std::time::Instant::now() < deadline {
++        let Ok(bytes) = control_rx.recv_timeout(Duration::from_millis(50)) else {
++            continue;
++        };
++        let ServerMessage::EndpointControl { kind, data } = read_server_message(bytes) else {
++            continue;
++        };
++        if kind == crate::protocol::endpoint::ACTIVATE_ENDPOINT_KIND {
++            return serde_json::from_str(&data).expect("activate endpoint params");
++        }
++    }
++    panic!("no activate endpoint control reached the shell");
++}
++
++#[tokio::test]
++async fn activate_endpoint_request_reaches_a_capable_client_shell() {
++    let mut server = test_headless_server();
++    let control_rx = connect_shell(&mut server, 1, true);
++
++    let response = dispatch(&mut server, activate_endpoint_request());
++
++    assert_eq!(response["result"]["type"], "client_activate_endpoint");
++    assert_eq!(response["result"]["delivered"], true);
++    let params = read_activate_endpoint_control(&control_rx);
++    assert_eq!(params.machine, "mac-mini");
++    assert_eq!(
++        params.target,
++        api::schema::ClientActivateEndpointTarget::Pane("w1D:p4Y".into())
++    );
++}
++
++#[tokio::test]
++async fn activate_endpoint_request_without_a_capable_shell_is_not_delivered() {
++    let mut server = test_headless_server();
++    let control_rx = connect_shell(&mut server, 1, false);
++
++    let response = dispatch(&mut server, activate_endpoint_request());
++
++    assert_eq!(response["result"]["type"], "client_activate_endpoint");
++    assert_eq!(response["result"]["delivered"], false);
++    assert!(
++        control_rx
++            .recv_timeout(Duration::from_millis(200))
++            .ok()
++            .is_none_or(|bytes| {
++                !matches!(
++                    read_server_message(bytes),
++                    ServerMessage::EndpointControl { kind, .. }
++                        if kind == crate::protocol::endpoint::ACTIVATE_ENDPOINT_KIND
++                )
++            }),
++        "an incapable shell must not receive the control"
++    );
++}
++
++#[tokio::test]
++async fn activate_endpoint_request_without_clients_is_not_delivered() {
++    let mut server = test_headless_server();
++
++    let response = dispatch(&mut server, activate_endpoint_request());
++
++    assert_eq!(response["result"]["type"], "client_activate_endpoint");
++    assert_eq!(response["result"]["delivered"], false);
++}
+diff --git a/src/server/headless/tests/mod.rs b/src/server/headless/tests/mod.rs
+index 3ab7ec0f..1895b743 100644
+--- a/src/server/headless/tests/mod.rs
++++ b/src/server/headless/tests/mod.rs
+@@ -1,5 +1,6 @@
+ use super::*;
+ 
++mod activate_endpoint;
+ mod event_fairness;
+ mod native_graphics;
+ #[path = "pane_move.rs"]
+@@ -740,6 +741,7 @@ async fn client_shell_attach_seeds_workspace() {
+             mouse_capture: false,
+             surface_active: true,
+             writer,
++            activate_endpoint: false,
+         })
+     );
+ 
+@@ -773,6 +775,7 @@ async fn completion_guard_endpoint_pairs_runtime_completions_with_snapshots() {
+         surface_delta: false,
+         surface_scroll: false,
+         writer,
++        activate_endpoint: false,
+     });
+     let (_, initial) = client_shell_projection(&control_rx);
+     assert!(initial.completions.is_empty());
+@@ -832,6 +835,7 @@ async fn client_shell_endpoint_request_uses_the_selected_connection() {
+             mouse_capture: false,
+             surface_active: true,
+             writer,
++            activate_endpoint: false,
+         })
+     );
+     let _initial_snapshot = client_shell_snapshot(&control_rx);
+@@ -951,6 +955,7 @@ async fn client_shell_pairs_agent_view_set_replacement_and_clear_with_snapshots(
+             mouse_capture: false,
+             surface_active: false,
+             writer,
++            activate_endpoint: false,
+         })
+     );
+     let initial = client_shell_snapshot(&control_rx);
+@@ -1054,6 +1059,7 @@ async fn client_shell_receives_metadata_then_shell_free_pane_surface() {
+             mouse_capture: false,
+             surface_active: true,
+             writer,
++            activate_endpoint: false,
+         })
+     );
+     let snapshot = client_shell_snapshot(&control_rx);
+@@ -1222,6 +1228,7 @@ fn connect_test_shell(
+             mouse_capture: false,
+             surface_active: true,
+             writer,
++            activate_endpoint: false,
+         })
+     );
+     (control, render)
+@@ -1827,6 +1834,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
+             mouse_capture: false,
+             surface_active: true,
+             writer: local_writer,
++            activate_endpoint: false,
+         })
+     );
+     let local_snapshot = client_shell_snapshot(&local_control);
+@@ -1852,6 +1860,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
+             mouse_capture: false,
+             surface_active: true,
+             writer: endpoint_writer,
++            activate_endpoint: false,
+         })
+     );
+     let endpoint_snapshot = client_shell_snapshot(&endpoint_control);
+@@ -2772,6 +2781,7 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
+             mouse_capture: false,
+             surface_active: true,
+             writer,
++            activate_endpoint: false,
+         })
+     );
+     let initial_revision = client_shell_snapshot(&control_rx).revision;
+@@ -3019,6 +3029,7 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
+             mouse_capture: false,
+             surface_active: true,
+             writer,
++            activate_endpoint: false,
+         })
+     );
+     let _snapshot = client_shell_snapshot(&control_rx);
+@@ -6458,6 +6469,7 @@ async fn client_shell_requests_host_pixels_for_an_unfocused_pixel_pane() {
+     assert!(
+         server.handle_server_event(ServerEvent::ClientShellConnected {
+             surface_reuse: false,
++            activate_endpoint: false,
+             surface_delta: false,
+             surface_scroll: false,
+             client_id: 7,
+diff --git a/src/server/headless/tests/surface_interest.rs b/src/server/headless/tests/surface_interest.rs
+index a7da046e..959ace8e 100644
+--- a/src/server/headless/tests/surface_interest.rs
++++ b/src/server/headless/tests/surface_interest.rs
+@@ -78,6 +78,7 @@ async fn metadata_only_shell_is_isolated_until_surface_activation() {
+             mouse_capture: true,
+             surface_active: false,
+             writer,
++            activate_endpoint: false,
+         })
+     );
+     let _ = client_shell_snapshot(&control_rx);
+@@ -294,6 +295,7 @@ async fn background_surface_activation_preserves_focused_viewer_geometry() {
+             mouse_capture: false,
+             surface_active: false,
+             writer,
++            activate_endpoint: false,
+         })
+     );
+     let _ = background_control
+@@ -408,6 +410,7 @@ async fn presentation_sync_epoch_replays_modes_and_title() {
+             mouse_capture: true,
+             surface_active: true,
+             writer,
++            activate_endpoint: false,
+         })
+     );
+     let _ = client_shell_snapshot(&control_rx);
+@@ -525,6 +528,7 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
+             mouse_capture: true,
+             surface_active: true,
+             writer: source_writer,
++            activate_endpoint: false,
+         })
+     );
+     let source_snapshot = client_shell_snapshot(&source_control);
+@@ -549,6 +553,7 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
+             mouse_capture: true,
+             surface_active: false,
+             writer: target_writer,
++            activate_endpoint: false,
+         })
+     );
+     let remote_snapshot = client_shell_snapshot(&target_control);
+diff --git a/tests/cli/app.rs b/tests/cli/app.rs
+new file mode 100644
+index 00000000..c18d558f
+--- /dev/null
++++ b/tests/cli/app.rs
+@@ -0,0 +1,95 @@
++use super::harness::*;
++
++fn run_app_cli(base: &Path, socket_path: &Path, args: &[&str]) -> std::process::Output {
++    let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
++    command
++        .args(args)
++        .env("HERDR_SOCKET_PATH", socket_path)
++        .env("XDG_STATE_HOME", base.join("state"))
++        .env("XDG_CONFIG_HOME", base.join("config"))
++        .env_remove("HERDR_SESSION")
++        .env_remove("HERDR_CLIENT_SOCKET_PATH")
++        .env_remove("HERDR_ENV")
++        .output()
++        .unwrap()
++}
++
++#[test]
++fn app_focus_without_a_machine_uses_the_local_focus_path() {
++    let base = unique_test_dir();
++    fs::create_dir_all(&base).unwrap();
++    let socket_path = base.join("herdr.sock");
++    let listener = UnixListener::bind(&socket_path).unwrap();
++
++    let server = thread::spawn(move || {
++        let (mut stream, line) = accept_fake_cli_operation(&listener);
++        stream
++            .write_all(br#"{"id":"cli:app:focus","result":{"type":"ok"}}"#)
++            .unwrap();
++        stream.write_all(b"\n").unwrap();
++        stream.flush().unwrap();
++        line
++    });
++
++    let output = run_app_cli(&base, &socket_path, &["app", "focus", "--pane", "1-1"]);
++
++    let line = server.join().unwrap();
++    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
++    assert_eq!(request["method"], "pane.focus");
++    assert_eq!(request["params"]["pane_id"], "1-1");
++    assert!(
++        output.status.success(),
++        "stderr: {}",
++        String::from_utf8_lossy(&output.stderr)
++    );
++    assert_eq!(String::from_utf8_lossy(&output.stdout), "focused (local)\n");
++    cleanup_test_base(&base);
++}
++
++#[test]
++fn app_focus_rejects_an_unknown_machine_without_touching_the_socket() {
++    let base = unique_test_dir();
++    fs::create_dir_all(&base).unwrap();
++    let socket_path = base.join("herdr.sock");
++
++    let output = run_app_cli(
++        &base,
++        &socket_path,
++        &[
++            "app",
++            "focus",
++            "--machine",
++            "no-such-machine-issue-73",
++            "--pane",
++            "1-1",
++        ],
++    );
++
++    assert_eq!(output.status.code(), Some(2));
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    assert!(
++        stderr.contains("unknown machine 'no-such-machine-issue-73'"),
++        "stderr: {stderr}"
++    );
++    cleanup_test_base(&base);
++}
++
++#[test]
++fn app_focus_requires_exactly_one_target() {
++    let base = unique_test_dir();
++    fs::create_dir_all(&base).unwrap();
++    let socket_path = base.join("herdr.sock");
++
++    for args in [
++        &["app", "focus"][..],
++        &["app", "focus", "--pane", "1-1", "--tab", "1-2"][..],
++        &["app", "focus", "--machine"][..],
++        &["app", "focus", "--pane", "1-1", "--json"][..],
++    ] {
++        let output = run_app_cli(&base, &socket_path, args);
++        assert_eq!(output.status.code(), Some(2), "{args:?}");
++        let stderr = String::from_utf8_lossy(&output.stderr);
++        assert!(stderr.contains("herdr app focus"), "{args:?}: {stderr}");
++    }
++    cleanup_test_base(&base);
++}
+diff --git a/tests/cli/mod.rs b/tests/cli/mod.rs
+index 0fdff6f1..7e08384b 100644
+--- a/tests/cli/mod.rs
++++ b/tests/cli/mod.rs
+@@ -2,6 +2,7 @@ mod agent_options;
+ mod agent_transport;
+ mod agent_wait;
+ mod agents;
++mod app;
+ mod harness;
+ mod hooks;
+ mod panes;
+-- 
+2.56.0
+
