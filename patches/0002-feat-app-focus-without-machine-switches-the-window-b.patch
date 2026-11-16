@@ -1,0 +1,184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: preciselytord <54438880+preciselytord@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 15:36:38 +0100
+Subject: [PATCH] feat: app focus without --machine switches the window back to
+ this machine
+
+`herdr app focus --pane <id>` only focused the local server, so a window
+showing a saved machine stayed there. It now also sends client.activate_endpoint
+with an empty machine, which the client shell resolves to the local endpoint,
+and prints "focused (app)" when a running window took it.
+---
+ src/cli/app.rs                      | 18 ++++++++++-
+ src/client/shell/endpoints.rs       |  6 ++--
+ src/client/shell/tests/endpoints.rs | 23 ++++++++++++++
+ tests/cli/app.rs                    | 48 +++++++++++++++++++++--------
+ 4 files changed, 80 insertions(+), 15 deletions(-)
+
+diff --git a/src/cli/app.rs b/src/cli/app.rs
+index 22f332ce..527ca391 100644
+--- a/src/cli/app.rs
++++ b/src/cli/app.rs
+@@ -217,6 +217,21 @@ fn local_focus(target: &ClientActivateEndpointTarget) -> std::io::Result<i32> {
+         eprintln!("{}", serde_json::to_string(&response).unwrap());
+         return Ok(1);
+     }
++    // The window may be showing a saved machine; ask it to switch back to this
++    // machine as well. An empty selector names the local endpoint.
++    let activation = Request {
++        id: "cli:app:focus:local".into(),
++        method: Method::ClientActivateEndpoint(ClientActivateEndpointParams {
++            machine: String::new(),
++            target: target.clone(),
++        }),
++    };
++    if super::send_request_unchecked(&activation)
++        .is_ok_and(|response| activation_delivered(&response))
++    {
++        println!("{FOCUSED_APP}");
++        return Ok(0);
++    }
+     println!("{FOCUSED_LOCAL}");
+     Ok(0)
+ }
+@@ -227,7 +242,8 @@ fn print_app_help() {
+         "  herdr app focus [--machine <label-or-id>] (--pane <id> | --tab <id> | --workspace <id>)"
+     );
+     eprintln!("    Jump a running app to the target. With --machine it switches the app");
+-    eprintln!("    to that saved machine; without one it focuses the local target.");
++    eprintln!("    to that saved machine; without one it switches the app back to this");
++    eprintln!("    machine and focuses the local target.");
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/client/shell/endpoints.rs b/src/client/shell/endpoints.rs
+index 4e242788..d4e07fdc 100644
+--- a/src/client/shell/endpoints.rs
++++ b/src/client/shell/endpoints.rs
+@@ -474,11 +474,13 @@ impl ClientShellState {
+         &self.active_endpoint_id == endpoint_id
+     }
+ 
+-    /// Resolves a saved-machine selector (profile ID or label) to an attached endpoint.
++    /// Resolves a saved-machine selector (profile ID or label, or empty for the
++    /// local machine) to an attached endpoint.
+     pub(crate) fn endpoint_for_machine_selector(&self, selector: &str) -> Option<ClientEndpointId> {
+         let selector = selector.trim();
++        // An empty selector names this machine (`herdr app focus` without --machine).
+         if selector.is_empty() {
+-            return None;
++            return Some(ClientEndpointId::Local);
+         }
+         if let Ok(profile_id) = crate::client::endpoint::ProfileId::parse(selector) {
+             let endpoint_id = ClientEndpointId::Ssh(profile_id);
+diff --git a/src/client/shell/tests/endpoints.rs b/src/client/shell/tests/endpoints.rs
+index d8d65232..cc253b3f 100644
+--- a/src/client/shell/tests/endpoints.rs
++++ b/src/client/shell/tests/endpoints.rs
+@@ -2946,6 +2946,29 @@ fn activate_endpoint_request_reports_an_offline_machine_without_navigating() {
+     );
+ }
+ 
++#[test]
++fn activate_endpoint_request_with_an_empty_machine_returns_to_the_local_machine() {
++    use crate::api::schema::ClientActivateEndpointTarget;
++
++    let (mut state, remote) = state_with_remote();
++    assert!(state.activate_endpoint_projection(&remote));
++    let outcome = state.activate_endpoint_request(&activate_request(
++        "",
++        ClientActivateEndpointTarget::Pane("pane_1".into()),
++    ));
++    assert!(
++        matches!(
++            outcome.actions.as_slice(),
++            [ClientShellAction::ActivateEndpoint {
++                endpoint_id: ClientEndpointId::Local,
++                target: Some(ClientEndpointFocusTarget::Pane(pane_id)),
++            }] if pane_id == "pane_1"
++        ),
++        "{:?}",
++        outcome.actions
++    );
++}
++
+ #[test]
+ fn activate_endpoint_request_ignores_unknown_and_ambiguous_machines() {
+     use crate::api::schema::ClientActivateEndpointTarget;
+diff --git a/tests/cli/app.rs b/tests/cli/app.rs
+index c18d558f..e8300d70 100644
+--- a/tests/cli/app.rs
++++ b/tests/cli/app.rs
+@@ -14,36 +14,60 @@ fn run_app_cli(base: &Path, socket_path: &Path, args: &[&str]) -> std::process::
+         .unwrap()
+ }
+ 
+-#[test]
+-fn app_focus_without_a_machine_uses_the_local_focus_path() {
++fn run_local_app_focus(activation_reply: &'static [u8]) -> (Vec<String>, std::process::Output) {
+     let base = unique_test_dir();
+     fs::create_dir_all(&base).unwrap();
+     let socket_path = base.join("herdr.sock");
+     let listener = UnixListener::bind(&socket_path).unwrap();
+ 
+     let server = thread::spawn(move || {
+-        let (mut stream, line) = accept_fake_cli_operation(&listener);
+-        stream
+-            .write_all(br#"{"id":"cli:app:focus","result":{"type":"ok"}}"#)
+-            .unwrap();
+-        stream.write_all(b"\n").unwrap();
+-        stream.flush().unwrap();
+-        line
++        let mut lines = Vec::new();
++        for reply in [
++            br#"{"id":"cli:app:focus","result":{"type":"ok"}}"#.as_slice(),
++            activation_reply,
++        ] {
++            let (mut stream, line) = accept_fake_cli_operation(&listener);
++            stream.write_all(reply).unwrap();
++            stream.write_all(b"\n").unwrap();
++            stream.flush().unwrap();
++            lines.push(line);
++        }
++        lines
+     });
+ 
+     let output = run_app_cli(&base, &socket_path, &["app", "focus", "--pane", "1-1"]);
++    let lines = server.join().unwrap();
++    cleanup_test_base(&base);
++    (lines, output)
++}
+ 
+-    let line = server.join().unwrap();
+-    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
++#[test]
++fn app_focus_without_a_machine_uses_the_local_focus_path() {
++    let (lines, output) = run_local_app_focus(
++        br#"{"id":"cli:app:focus:local","result":{"type":"client_activate_endpoint","delivered":false}}"#,
++    );
++
++    let request: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+     assert_eq!(request["method"], "pane.focus");
+     assert_eq!(request["params"]["pane_id"], "1-1");
++    let activation: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
++    assert_eq!(activation["method"], "client.activate_endpoint");
++    assert_eq!(activation["params"]["machine"], "");
+     assert!(
+         output.status.success(),
+         "stderr: {}",
+         String::from_utf8_lossy(&output.stderr)
+     );
+     assert_eq!(String::from_utf8_lossy(&output.stdout), "focused (local)\n");
+-    cleanup_test_base(&base);
++}
++
++#[test]
++fn app_focus_without_a_machine_switches_a_running_app_back_to_local() {
++    let (_lines, output) = run_local_app_focus(
++        br#"{"id":"cli:app:focus:local","result":{"type":"client_activate_endpoint","delivered":true}}"#,
++    );
++    assert!(output.status.success());
++    assert_eq!(String::from_utf8_lossy(&output.stdout), "focused (app)\n");
+ }
+ 
+ #[test]

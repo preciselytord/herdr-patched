@@ -9,6 +9,7 @@ fork: this repo holds only the patches, a PKGBUILD and the release workflow.
 | Patch | What it adds | Origin |
 |---|---|---|
 | `0001-feat-add-an-external-activate-endpoint-trigger-for-t.patch` | `herdr app focus [--machine <label>] --pane/--tab/--workspace <id>` and the `client.activate_endpoint` API: switch the running window to a saved machine and focus a target there. Upstream discussion: [herdrdev/herdr#4396](https://github.com/herdrdev/herdr/discussions/4396). | Backport of [arrrrny/herdr@0aa31c6a](https://github.com/arrrrny/herdr/commit/0aa31c6a) to v0.9.5, code and tests only (no docs). |
+| `0002-feat-app-focus-without-machine-switches-the-window-b.patch` | `herdr app focus --pane <id>` without `--machine` also switches the window back to this machine (an empty machine selector names the local endpoint). | Ours. |
 
 Only the machine running the Herdr window needs this build. Saved machines can
 stay on stock Herdr: the new hello field is optional and stock servers ignore it.

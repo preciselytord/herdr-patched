@@ -2,7 +2,7 @@
 # pkgver, _zigver and the checksums are rewritten by scripts/rebase.sh.
 pkgname=herdr-patched
 pkgver=0.9.5
-pkgrel=1
+pkgrel=2
 _zigver=0.16.0
 _zigsha=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
 pkgdesc="Herdr terminal multiplexer for coding agents, with extra patches (herdr app focus)"

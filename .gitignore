@@ -5,3 +5,4 @@ herdr/
 *.pkg.tar.*
 *.tar.xz
 build.log
+.claude/
