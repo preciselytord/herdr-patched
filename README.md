@@ -41,9 +41,10 @@ The packages are unsigned; trust rests on HTTPS and this GitHub repository.
 1. If `herdrdev/herdr` has a new stable release (`vX.Y.Z`, no previews),
    `scripts/rebase.sh` replays `patches/` onto the new tag and picks up the Zig
    version upstream builds with (checksum from ziglang.org).
-2. `scripts/build.sh` runs `makepkg` in `archlinux:base-devel`: build, the full
-   upstream test suite, package, `repo-add`.
-3. On success it commits the rebased patches and replaces the files on the
+2. `scripts/test.sh` runs upstream's full test suite with the patches applied,
+   on a plain Ubuntu runner with cargo-nextest, the way upstream CI does.
+3. `scripts/build.sh` runs `makepkg` in `archlinux:base-devel` and `repo-add`.
+4. On success it commits the rebased patches and replaces the files on the
    `repo` release. On any failure it opens an issue and publishes nothing, so
    installed machines stay on the last good build.
 
@@ -53,6 +54,7 @@ Bump `pkgrel` when you change a patch without a new upstream release.
 ## Local build
 
 ```sh
+scripts/test.sh             # upstream tests with the patches (needs cargo-nextest)
 scripts/build.sh            # out/ holds the package and the repo database
 scripts/rebase.sh v0.9.6    # move the patches to another release
 ```

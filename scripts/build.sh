@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 rm -rf out && mkdir -p out
 
 if [[ $EUID == 0 ]]; then
-  pacman -Syu --noconfirm --needed git rustup cargo-nextest jq >/dev/null
+  pacman -Syu --noconfirm --needed git rustup jq >/dev/null
   id builder >/dev/null 2>&1 || useradd -m builder
   chown -R builder: .
   su builder -c 'makepkg --noconfirm --cleanbuild'
