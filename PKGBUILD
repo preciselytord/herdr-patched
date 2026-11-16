@@ -27,6 +27,7 @@ prepare() {
 _env() {
   export ZIG="$srcdir/zig-x86_64-linux-$_zigver/zig"
   export CARGO_HOME="$srcdir/cargo-home"
+  export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$srcdir=/build"
   export RUSTUP_TOOLCHAIN=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$srcdir/herdr/rust-toolchain.toml")
   rustup toolchain install --profile minimal "$RUSTUP_TOOLCHAIN" >/dev/null
 }

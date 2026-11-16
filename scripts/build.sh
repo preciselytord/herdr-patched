@@ -18,7 +18,8 @@ mv ./*.pkg.tar.zst out/
 cd out
 repo-add -q herdr-patched.db.tar.gz ./*.pkg.tar.zst
 # GitHub release assets cannot be symlinks; ship real files under pacman's names.
-cp -L herdr-patched.db.tar.gz herdr-patched.db
-cp -L herdr-patched.files.tar.gz herdr-patched.files
+rm -f herdr-patched.db herdr-patched.files
+cp herdr-patched.db.tar.gz herdr-patched.db
+cp herdr-patched.files.tar.gz herdr-patched.files
 rm -f ./*.tar.gz ./*.old
 ls -la
